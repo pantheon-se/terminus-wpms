@@ -35,9 +35,20 @@ class MoveSiteCommand extends TerminusCommand implements SiteAwareInterface
      */
     public function moveSite($source_site_env, $target_site_env,  $site_id)
     {
+        //TODO: Allow an array of site IDs to move multiple sites with a single call. 
+        //Alternatively, another function that takes a source, target, and array, have it loop through array and call move for each.
+
+        //TODO: Reaplce echo messages with real logging with levels to allow different levels of verbosity.
+
         // wake up the environments so that commands won't randomly throw errors.
         $this->wakeEnv($source_site_env);
         $this->wakeEnv($target_site_env);
+
+        // prep local filesystem for logs and files
+        if (!file_exists("/tmp/files/"))
+            mkdir("/tmp/files/");
+        if (!file_exists("/tmp/files/{$site_id}"))
+            mkdir("/tmp/files/{$site_id}");
 
         $source_connection_attributes = $this->getEnv($source_site_env)->connectionInfo();
         $target_connection_attributes = $this->getEnv($target_site_env)->connectionInfo();
@@ -54,7 +65,7 @@ class MoveSiteCommand extends TerminusCommand implements SiteAwareInterface
         $query = $this->db($source_site_env)->prepare("show tables like :site_table_pattern ");
         $query->execute([':site_table_pattern' => "wp_{$site_id}\_%"]);
         // debug query output
-//        $query->debugDumpParams();
+        // $query->debugDumpParams();
         $table_list = $query->fetchAll(PDO::FETCH_COLUMN, 0);
 
         // rather than pdo export/transfer the data between sites, we'll use the shell to run mysqldump for export, and mysql to import.
@@ -66,10 +77,13 @@ class MoveSiteCommand extends TerminusCommand implements SiteAwareInterface
 
         $target_connection_attributes['mysql_command']=str_replace("mysql", "mysql -A", $target_connection_attributes['mysql_command']);
 
-        echo("Copying Database tables\r\n");
+        echo("Copying Database tables (Site ID: {$site_id})\r\n");
+        //echo("$dump_command| {$target_connection_attributes['mysql_command']}");
         ob_start();
-        shell_exec("$dump_command 2>&1 | {$target_connection_attributes['mysql_command']}  2>&1");
+        shell_exec("$dump_command 2> /tmp/files/exportlog.{$source_site_env}.{$site_id}.txt| {$target_connection_attributes['mysql_command']}  2>> /tmp/files/importlog.{$target_site_env}.{$site_id}.txt");
         ob_end_clean();
+        echo("Finished copying Database tables (Site ID: {$site_id})\r\n");
+        echo("Updating site entry (Site ID: {$site_id})\r\n");
         // move the one wp_blogs entry over.
         $query = $this->db($source_site_env)->prepare("select * from wp_blogs where blog_id = ? ");
         $query->execute([$site_id]);
@@ -81,6 +95,7 @@ class MoveSiteCommand extends TerminusCommand implements SiteAwareInterface
 
         $query = $this->db($target_site_env)->prepare($insert_string);
         $query->execute(array_values($blog));
+        echo("Finished updating site entry (Site ID: {$site_id})\r\n");
 
         $this->rsync($source_site_env, $target_site_env, $site_id);
     }
@@ -152,10 +167,9 @@ class MoveSiteCommand extends TerminusCommand implements SiteAwareInterface
         $siteUUID = $this->getSite($site_env)->serialize()['id'];
         list($site, $env) = explode(".", $site_env);
 
-        mkdir("/tmp/files/");
-        mkdir("/tmp/files/{$site_id}");
         // download the site files
 
+        echo("Creating rsync manifest (Site ID: {$site_id})\r\n");
         // in order to show a decent status using rsync < 3.0.0 (OSX ships with 2.6.4)
         // we need to do a dry-run at the source first, save the list, then do the transfer.
 //        $generateManifest = new Process("rsync -rvlz --copy-unsafe-links --size-only --checksum --ipv4 --progress -e 'ssh -p 2222' $env.$siteUUID@appserver.$env.$siteUUID.drush.in:files/sites/{$site_id}/ /tmp/files/{$site_id} --dry-run > /tmp/files/manifest.{$site_env}.{$site_id}.txt");
@@ -169,10 +183,10 @@ class MoveSiteCommand extends TerminusCommand implements SiteAwareInterface
             "-e",
             "ssh -p 2222",
             "$env.$siteUUID@appserver.$env.$siteUUID.drush.in:files/sites/{$site_id}/",
-            "/tmp/files/{$site_id}",
+            "/tmp/files/{$site_id}/",
             "--dry-run",
         ]);
-$generateManifest->setTimeout(10000000);
+        $generateManifest->setTimeout(10000000);
         $generateManifest->start();
 
         // not sure if order matters here, but this does provide output that can be written to a file.
@@ -204,6 +218,9 @@ $generateManifest->setTimeout(10000000);
         }
         fclose($handleFile);
 
+        echo("Finished creating rsync manifest (Site ID: {$site_id})\r\n");
+
+
 
 //        exec("rsync -rvlz --copy-unsafe-links --size-only --checksum --ipv4 --progress -e 'ssh -p 2222' $env.$siteUUID@appserver.$env.$siteUUID.drush.in:files/sites/{$site_id}/ /tmp/files/{$site_id} --files-from=/tmp/files/manifest.{$site_env}.{$site_id}.txt\r\n");
         $process = new Process(["rsync",
@@ -223,7 +240,7 @@ $generateManifest->setTimeout(10000000);
         $process->setTimeout(10000000);
         $process->start();
 
-        echo("Downloading files from remote\r\n");
+        echo("Downloading files from remote (Site ID: {$site_id})\r\n");
 
         $process->wait(function ($type, $buffer) use (&$linecount) {
             // for this, we need to on-screen the errors, and send output to a file
@@ -237,7 +254,7 @@ $generateManifest->setTimeout(10000000);
             }
         });
 
-        echo("\rFiles Remaining: Complete!\r\n");
+        echo("\rFiles Remaining: Complete! (Site ID: {$site_id})\r\n");
     }
 
     /**
@@ -267,7 +284,6 @@ $generateManifest->setTimeout(10000000);
         // rsync to the target
 //        exec("rsync -rLvz --size-only --checksum --ipv4 --progress -e 'ssh -p 2222' /tmp/files/{$site_id}/ --temp-dir=~/tmp/ $env.$siteUUID@appserver.$env.$siteUUID.drush.in:files/sites/{$site_id}/");
 
-
         $process = new Process(["rsync",
             "-rvlz",
             "--copy-unsafe-links",
@@ -279,12 +295,12 @@ $generateManifest->setTimeout(10000000);
             "ssh -p 2222",
 //            "--files-from=/tmp/files/manifest.{$site_env}.{$site_id}.txt",
             "/tmp/files/{$site_id}",
-            "$env.$siteUUID@appserver.$env.$siteUUID.drush.in:files/sites/{$site_id}/",
+            "$env.$siteUUID@appserver.$env.$siteUUID.drush.in:files/sites/",
         ]);
         $process->setTimeout(10000000);
         $process->start();
 
-        echo("Uploading files to remote\r\n");
+        echo("Uploading files to remote (Site ID: {$site_id})\r\n");
         $linecount = 0;
         $process->wait(function ($type, $buffer) use (&$linecount) {
             // for this, we need to on-screen the errors, and send output to a file
@@ -298,7 +314,7 @@ $generateManifest->setTimeout(10000000);
             }
         });
 
-        echo("\rFiles Uploaded: Complete!\r\n");
+        echo("\rFiles Uploaded: Complete! (Site ID: {$site_id})\r\n");
 
 
 
